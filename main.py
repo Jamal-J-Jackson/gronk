@@ -227,7 +227,7 @@ async def search_history(ctx, *, query_text: str):
                 extra_body={
                     "search_parameters": {
                         "mode": "auto",
-                        "max_search_results": 5
+                        "max_search_results": 3  # Reduced from 5 to save costs ($0.075 vs $0.125 per search)
                     }
                 }
             )
@@ -652,13 +652,19 @@ async def on_message(message):
                         extra_body={
                             "search_parameters": {
                                 "mode": "auto",  # Let Grok decide when to search
-                                "max_search_results": 5
+                                "max_search_results": 3  # Reduced from 5 to save costs ($0.075 vs $0.125 per search)
                             }
                         }
                     )
                 
                 response = completion.choices[0].message.content
                 logger.info(f'Received response from Grok ({len(response)} characters)')
+                
+                # Convert Twitter/X usernames to clickable links
+                # Match @username patterns (not already in URLs)
+                twitter_pattern = r'(?<![:/\w])@([A-Za-z0-9_]{1,15})(?!\w)'
+                response = re.sub(twitter_pattern, r'[@\1](https://x.com/\1)', response)
+                logger.info(f'Converted Twitter mentions to links')
                 
                 # Store conversation history (only for non-search, text-only conversations)
                 if is_replying_to_bot and not is_search_followup and not image_urls:
@@ -677,13 +683,14 @@ async def on_message(message):
                 
                 # Track token usage and calculate cost
                 request_cost = 0
+                search_cost = 0
                 usage_text = ""
                 if hasattr(completion, 'usage') and completion.usage:
                     token_usage['input_tokens'] += completion.usage.prompt_tokens
                     token_usage['output_tokens'] += completion.usage.completion_tokens
                     token_usage['requests'] += 1
                     
-                    # Calculate cost based on actual model used
+                    # Calculate token cost based on actual model used
                     model_used = completion.model
                     if 'vision' in model_used.lower():
                         # Grok-vision pricing: $2/1M input, $10/1M output
@@ -700,9 +707,20 @@ async def on_message(message):
                             input_cost = (completion.usage.prompt_tokens / 1_000_000) * 0.20
                         output_cost = (completion.usage.completion_tokens / 1_000_000) * 0.50
                     
-                    request_cost = input_cost + output_cost
-                    usage_text = f"💵 ${request_cost:.6f} • {completion.usage.prompt_tokens} in / {completion.usage.completion_tokens} out"
-                    logger.info(f"Token usage - Input: {completion.usage.prompt_tokens}, Output: {completion.usage.completion_tokens}, Cost: ${request_cost:.6f}")
+                    # Calculate search cost if sources were used ($25 per 1K sources)
+                    num_sources = getattr(completion.usage, 'num_sources_used', 0)
+                    if num_sources > 0:
+                        search_cost = (num_sources / 1000) * 25.00
+                        logger.info(f"Search usage - Sources used: {num_sources}, Cost: ${search_cost:.6f}")
+                    
+                    request_cost = input_cost + output_cost + search_cost
+                    
+                    if search_cost > 0:
+                        usage_text = f"💵 ${request_cost:.6f} (🔍 ${search_cost:.6f} search) • {completion.usage.prompt_tokens} in / {completion.usage.completion_tokens} out"
+                    else:
+                        usage_text = f"💵 ${request_cost:.6f} • {completion.usage.prompt_tokens} in / {completion.usage.completion_tokens} out"
+                    
+                    logger.info(f"Token usage - Input: {completion.usage.prompt_tokens}, Output: {completion.usage.completion_tokens}, Search sources: {num_sources}, Total cost: ${request_cost:.6f}")
                 
                 # Create embed(s) for the response
                 # Discord embed description limit is 4096 characters
