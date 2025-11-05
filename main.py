@@ -1,0 +1,791 @@
+import discord
+from discord.ext import commands
+import os
+from openai import OpenAI
+from dotenv import load_dotenv
+import logging
+import re
+from typing import Optional
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('GrokBot')
+
+load_dotenv()
+
+TOKEN = os.getenv('DISCORD_TOKEN')
+XAI_KEY = os.getenv('XAI_API_KEY')
+
+client = OpenAI(api_key=XAI_KEY, base_url="https://api.x.ai/v1")
+
+bot = commands.Bot(command_prefix='!', intents=discord.Intents.all())
+
+# Track token usage
+token_usage = {
+    'input_tokens': 0,
+    'output_tokens': 0,
+    'requests': 0
+}
+
+# Track search context for follow-up queries
+search_context = {}  # {channel_id: {user_id: {searched_user: User, messages: [...], query: str}}}
+
+# Track conversation history for context awareness
+conversation_history = {}  # {channel_id: {user_id: [{"role": "user/assistant", "content": str}]}}
+
+@bot.event
+async def on_ready():
+    logger.info(f'Bot logged in as {bot.user} (ID: {bot.user.id})')
+    logger.info(f'Connected to {len(bot.guilds)} server(s)')
+
+@bot.command(name='usage')
+async def check_usage(ctx):
+    """Check bot's token usage statistics"""
+    logger.info(f'Usage command requested by {ctx.author}')
+    
+    embed = discord.Embed(
+        title="📊 Grok API Usage Statistics",
+        description="Current session token usage",
+        color=discord.Color.green()
+    )
+    
+    embed.add_field(
+        name="📥 Input Tokens",
+        value=f"{token_usage['input_tokens']:,}",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="📤 Output Tokens",
+        value=f"{token_usage['output_tokens']:,}",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="🔢 Total Requests",
+        value=f"{token_usage['requests']:,}",
+        inline=True
+    )
+    
+    # Calculate estimated cost (based on xAI official pricing 2025)
+    # Grok-4-fast: $0.20 per 1M input, $0.50 per 1M output
+    # Grok-2-vision: $2.00 per 1M input, $10.00 per 1M output
+    # Using Grok-4-fast pricing (most common)
+    input_cost = (token_usage['input_tokens'] / 1_000_000) * 0.20
+    output_cost = (token_usage['output_tokens'] / 1_000_000) * 0.50
+    total_cost = input_cost + output_cost
+    
+    embed.add_field(
+        name="💰 Estimated Cost",
+        value=f"${total_cost:.4f}",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📊 Cost Breakdown",
+        value=f"Input: ${input_cost:.4f} | Output: ${output_cost:.4f}",
+        inline=False
+    )
+    
+    embed.set_footer(text="Grok-4-fast: $0.20/1M in, $0.50/1M out | Grok-vision: $2/1M in, $10/1M out | Beta: $25 free")
+    
+    await ctx.reply(embed=embed)
+
+@bot.command(name='search')
+async def search_history(ctx, *, query_text: str):
+    """Search message history in this channel
+    Usage: !search query text here (searches all messages)
+    Usage: !search @user query text here (searches specific user)
+    Usage: !search @user 2000 query (specify message limit)
+    Usage: !search keyword:Python what are discussions about Python (pre-filter by keyword)
+    Example: !search who mentioned Python
+    Example: !search @john tell me about his projects
+    Example: !search @john 5000 what are his opinions on AI
+    Example: !search keyword:bot summarize bot discussions
+    """
+    if not query_text:
+        await ctx.reply("❌ Please provide a search query. Usage: `!search query` or `!search @user query`")
+        return
+    
+    # Check if a user is mentioned
+    target_user = None
+    if ctx.message.mentions:
+        target_user = ctx.message.mentions[0]
+        # Remove user mention from query
+        query_text = query_text.replace(f'<@{target_user.id}>', '').replace(f'<@!{target_user.id}>', '').strip()
+    
+    # Parse optional limit, keyword filter, and query
+    limit = 1000
+    keyword_filter = None
+    query = query_text
+    
+    # Check for keyword filter
+    if query_text.startswith('keyword:'):
+        parts = query_text.split(None, 1)
+        keyword_filter = parts[0].replace('keyword:', '').lower()
+        query = parts[1] if len(parts) > 1 else ""
+        if not query:
+            await ctx.reply("❌ Please provide a search query after the keyword filter.")
+            return
+    
+    # Check if first word is a number (limit)
+    if query:
+        parts = query.split(None, 1)
+        if parts[0].isdigit():
+            limit = int(parts[0])
+            query = parts[1] if len(parts) > 1 else ""
+            if not query:
+                await ctx.reply("❌ Please provide a search query after the limit.")
+                return
+    
+    if target_user:
+        logger.info(f'Search command by {ctx.author} for user {target_user} with query: {query}, limit: {limit}')
+    else:
+        logger.info(f'Search command by {ctx.author} for ALL users with query: {query}, limit: {limit}')
+    
+    # Send a "searching" message
+    if target_user:
+        searching_msg = await ctx.reply(f"🔍 Searching {target_user.mention}'s message history (last {limit} messages)...")
+    else:
+        searching_msg = await ctx.reply(f"🔍 Searching channel message history (last {limit} messages)...")
+    
+    try:
+        # Collect messages
+        collected_messages = []
+        messages_scanned = 0
+        
+        async for msg in ctx.channel.history(limit=limit * 3 if keyword_filter else limit):
+            messages_scanned += 1
+            
+            # Apply keyword filter first if specified
+            if keyword_filter and keyword_filter not in msg.content.lower():
+                continue
+            
+            if target_user:
+                # Search specific user
+                if msg.author == target_user:
+                    collected_messages.append(msg)
+            else:
+                # Search all users (exclude bots)
+                if not msg.author.bot:
+                    collected_messages.append(msg)
+            
+            # Stop if we have enough filtered messages
+            if keyword_filter and len(collected_messages) >= limit:
+                break
+        
+        if not collected_messages:
+            if target_user:
+                await searching_msg.edit(content=f"❌ No messages found from {target_user.mention} in this channel.")
+            else:
+                await searching_msg.edit(content=f"❌ No messages found in this channel.")
+            return
+        
+        if target_user:
+            logger.info(f'Found {len(collected_messages)} messages from {target_user}' + (f' (filtered by "{keyword_filter}")' if keyword_filter else ''))
+        else:
+            logger.info(f'Found {len(collected_messages)} messages from all users' + (f' (filtered by "{keyword_filter}")' if keyword_filter else ''))
+        
+        # Store search context for follow-ups
+        if ctx.channel.id not in search_context:
+            search_context[ctx.channel.id] = {}
+        search_context[ctx.channel.id][ctx.author.id] = {
+            'searched_user': target_user,
+            'messages': collected_messages,
+            'last_query': query
+        }
+        
+        # Build context for Grok (use up to 100 messages to stay within token limits)
+        messages_to_analyze = min(len(collected_messages), 100)
+        if target_user:
+            context_parts = [f"Search query: {query}\n\nUser {target_user.name}'s recent messages (showing {messages_to_analyze} of {len(collected_messages)} found):\n"]
+        else:
+            context_parts = [f"Search query: {query}\n\nChannel messages (showing {messages_to_analyze} of {len(collected_messages)} found):\n"]
+        
+        for i, msg in enumerate(reversed(collected_messages[-messages_to_analyze:]), 1):
+            timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M")
+            author_name = msg.author.name if not target_user else ""
+            content = msg.content[:300] + "..." if len(msg.content) > 300 else msg.content
+            if target_user:
+                context_parts.append(f"[{i}] [{timestamp}] {content}")
+            else:
+                context_parts.append(f"[{i}] [{timestamp}] {author_name}: {content}")
+        
+        context_parts.append(f"\n\nBased on these messages, {query}")
+        full_prompt = "\n".join(context_parts)
+        
+        # Query Grok
+        async with ctx.channel.typing():
+            completion = client.chat.completions.create(
+                model="grok-4-fast",
+                messages=[
+                    {"role": "user", "content": full_prompt}
+                ],
+                extra_body={
+                    "search_parameters": {
+                        "mode": "auto",
+                        "max_search_results": 5
+                    }
+                }
+            )
+            
+            response = completion.choices[0].message.content
+            
+            # Calculate cost
+            request_cost = 0
+            usage_text = ""
+            if hasattr(completion, 'usage') and completion.usage:
+                if hasattr(completion.usage, 'prompt_tokens_details') and completion.usage.prompt_tokens_details:
+                    cached = completion.usage.prompt_tokens_details.cached_tokens
+                    uncached = completion.usage.prompt_tokens - cached
+                    input_cost = (uncached / 1_000_000) * 0.20 + (cached / 1_000_000) * 0.05
+                else:
+                    input_cost = (completion.usage.prompt_tokens / 1_000_000) * 0.20
+                output_cost = (completion.usage.completion_tokens / 1_000_000) * 0.50
+                request_cost = input_cost + output_cost
+                usage_text = f"💵 ${request_cost:.6f} • {completion.usage.prompt_tokens} in / {completion.usage.completion_tokens} out"
+                
+                # Track usage
+                token_usage['input_tokens'] += completion.usage.prompt_tokens
+                token_usage['output_tokens'] += completion.usage.completion_tokens
+                token_usage['requests'] += 1
+            
+            # Delete searching message
+            await searching_msg.delete()
+            
+            # Create response embed
+            if target_user:
+                title = f"🔍 Search Results: {target_user.display_name}"
+            else:
+                title = "🔍 Search Results: Channel History"
+            
+            # Truncate response if too long for embed (6000 char total limit for entire embed)
+            # Description limit is 4096, but we need room for other fields
+            max_description_length = 3500
+            if len(response) > max_description_length:
+                response = response[:max_description_length] + "\n\n... *(response truncated due to length)*"
+            
+            embed = discord.Embed(
+                title=title,
+                description=response,
+                color=discord.Color.purple(),
+                timestamp=ctx.message.created_at
+            )
+            embed.set_author(
+                name="Grok Search",
+                icon_url="https://pbs.twimg.com/profile_images/1683899100922511378/5lY42eHs_400x400.jpg"
+            )
+            embed.add_field(
+                name="Query",
+                value=query[:1024],
+                inline=False
+            )
+            messages_info = f"{len(collected_messages)} total (analyzed {messages_to_analyze})"
+            if keyword_filter:
+                messages_info += f"\nFiltered by: `{keyword_filter}`"
+            
+            embed.add_field(
+                name="Messages Found",
+                value=messages_info,
+                inline=True
+            )
+            
+            # Add links to most recent messages
+            recent_links = []
+            for msg in collected_messages[:5]:  # Link to 5 most recent
+                msg_link = f"https://discord.com/channels/{ctx.guild.id}/{ctx.channel.id}/{msg.id}"
+                timestamp = msg.created_at.strftime("%b %d, %H:%M")
+                preview = msg.content[:50] + "..." if len(msg.content) > 50 else msg.content
+                if target_user:
+                    recent_links.append(f"[{timestamp}]({msg_link}): {preview}")
+                else:
+                    recent_links.append(f"[{timestamp}]({msg_link}) **{msg.author.name}**: {preview}")
+            
+            if recent_links:
+                embed.add_field(
+                    name="🔗 Recent Messages",
+                    value="\n".join(recent_links),
+                    inline=False
+                )
+            
+            embed.add_field(
+                name="💡 Follow-up",
+                value="Reply to this message to ask more questions about this user's history",
+                inline=False
+            )
+            
+            footer_text = f"Requested by {ctx.author.display_name}"
+            if usage_text:
+                footer_text += f" • {usage_text}"
+            embed.set_footer(text=footer_text, icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+            
+            await ctx.reply(embed=embed)
+            logger.info(f'Search completed successfully')
+            
+    except Exception as e:
+        logger.error(f'Error in search command: {e}', exc_info=True)
+        try:
+            await searching_msg.edit(content=f"❌ Error searching messages: {str(e)}")
+        except:
+            # If searching message was already deleted, send a new message
+            await ctx.reply(f"❌ Error searching messages: {str(e)}")
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+
+    # Check if bot is mentioned OR if user is replying to bot's message
+    is_bot_mentioned = bot.user in message.mentions
+    is_replying_to_bot = False
+    
+    if message.reference:
+        try:
+            replied_msg = await message.channel.fetch_message(message.reference.message_id)
+            is_replying_to_bot = replied_msg.author == bot.user
+        except:
+            pass
+    
+    if is_bot_mentioned or is_replying_to_bot:
+        if is_replying_to_bot:
+            logger.info(f'Bot reply detected from {message.author} in #{message.channel}')
+        else:
+            logger.info(f'Bot mentioned by {message.author} in #{message.channel}')
+        
+        # Build context if this is a reply
+        prompt = message.content.replace(f'<@{bot.user.id}>', '').replace(f'<@!{bot.user.id}>', '').strip()
+        
+        # Check if this is a follow-up to a previous conversation
+        is_search_followup = False
+        conversation_context = []
+        
+        if is_replying_to_bot:
+            try:
+                replied_msg = await message.channel.fetch_message(message.reference.message_id)
+                
+                # Check if the replied message was a search result
+                if replied_msg.embeds and replied_msg.embeds[0].title and "Search Results" in replied_msg.embeds[0].title:
+                    if message.channel.id in search_context and message.author.id in search_context[message.channel.id]:
+                        is_search_followup = True
+                        logger.info(f'Detected search follow-up query')
+                        
+                        # Get stored search context
+                        ctx_data = search_context[message.channel.id][message.author.id]
+                        searched_user = ctx_data['searched_user']
+                        user_messages = ctx_data['messages']
+                        
+                        # Build context with previous search data
+                        messages_to_analyze = min(len(user_messages), 100)
+                        context_parts = [
+                            f"Previous search was about user {searched_user.name if searched_user else 'channel history'}.",
+                            f"Follow-up query: {prompt}\n",
+                            f"\n{'User ' + searched_user.name if searched_user else 'Channel'} messages (showing {messages_to_analyze} of {len(user_messages)} found):\n"
+                        ]
+                        for i, msg in enumerate(reversed(user_messages[-messages_to_analyze:]), 1):
+                            timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M")
+                            content = msg.content[:300] + "..." if len(msg.content) > 300 else msg.content
+                            context_parts.append(f"[{i}] [{timestamp}] {content}")
+                        
+                        context_parts.append(f"\n\nAnswer this follow-up question: {prompt}")
+                        prompt = "\n".join(context_parts)
+                        logger.info(f'Built search follow-up context with {len(user_messages)} messages')
+                
+                # Check if we have conversation history with this message
+                elif replied_msg.id in conversation_history:
+                    logger.info('Detected conversation follow-up with history')
+                    prev_conv = conversation_history[replied_msg.id]
+                    
+                    # Build conversation history for context
+                    conversation_context = [
+                        {"role": "user", "content": prev_conv['user_query']},
+                        {"role": "assistant", "content": prev_conv['bot_response']},
+                        {"role": "user", "content": prompt}
+                    ]
+                    logger.info('Built conversation context with previous exchange')
+            except Exception as e:
+                logger.warning(f'Error fetching conversation context: {e}')
+        
+        # Get conversation history for this user (if replying to bot)
+        conversation_messages = []
+        use_conversation_history = False
+        if is_replying_to_bot and not is_search_followup:
+            # Initialize conversation history for this channel/user if needed
+            if message.channel.id not in conversation_history:
+                conversation_history[message.channel.id] = {}
+            if message.author.id not in conversation_history[message.channel.id]:
+                conversation_history[message.channel.id][message.author.id] = []
+            
+            # Get last 5 exchanges (10 messages max) to keep context window reasonable
+            conversation_messages = conversation_history[message.channel.id][message.author.id][-10:]
+            if conversation_messages:
+                use_conversation_history = True
+                logger.info(f'Using conversation history mode with {len(conversation_messages)} previous messages')
+        logger.info(f'Extracted prompt: "{prompt}"')
+        
+        # Helper function to check if URL is a supported image type
+        def is_supported_image(url):
+            """Check if URL ends with supported image extensions"""
+            supported_extensions = ['.jpg', '.jpeg', '.png', '.webp']
+            url_lower = url.lower().split('?')[0]  # Remove query params
+            return any(url_lower.endswith(ext) for ext in supported_extensions)
+        
+        # Collect images from the current message
+        image_urls = []
+        unsupported_images = []
+        
+        # Check for direct attachments
+        for attachment in message.attachments:
+            if attachment.content_type and attachment.content_type.startswith('image/'):
+                if is_supported_image(attachment.url) or attachment.content_type in ['image/jpeg', 'image/jpg', 'image/png', 'image/webp']:
+                    image_urls.append(attachment.url)
+                    logger.info(f'Found image attachment: {attachment.filename}')
+                else:
+                    unsupported_images.append(attachment.filename)
+                    logger.warning(f'Unsupported image type: {attachment.filename} ({attachment.content_type})')
+        
+        # Check for image URLs in message content (links to images)
+        image_url_pattern = r'https?://(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}(?:/[^\s]*)?\.(?:jpg|jpeg|png|webp)(?:\?[^\s]*)?'
+        found_urls = re.findall(image_url_pattern, message.content, re.IGNORECASE)
+        for url in found_urls:
+            if url not in image_urls:
+                image_urls.append(url)
+                logger.info(f'Found image URL in message: {url}')
+        
+        # Check for Discord CDN embeds (when links auto-embed like Tenor, Giphy, etc.)
+        for embed in message.embeds:
+            # For gif/video embeds (Tenor, Giphy), prefer video/image in this order
+            if embed.type in ['gifv', 'video', 'image', 'rich']:
+                # Try to get the actual media URL
+                media_url = None
+                
+                if embed.image and embed.image.url:
+                    media_url = embed.image.url
+                elif embed.video and embed.video.url:
+                    media_url = embed.video.url
+                elif embed.thumbnail and embed.thumbnail.url:
+                    media_url = embed.thumbnail.url
+                elif embed.url:
+                    media_url = embed.url
+                
+                if media_url and media_url not in image_urls:
+                    # Only add if it's a supported format
+                    if is_supported_image(media_url):
+                        image_urls.append(media_url)
+                        logger.info(f'Found media in embed ({embed.type}): {media_url}')
+                    else:
+                        logger.warning(f'Skipping unsupported media format: {media_url}')
+        
+        # If replying to another message, get full context (unless using conversation history)
+        if message.reference and not use_conversation_history:
+            logger.info('Message is a reply, fetching conversation context...')
+            try:
+                # First, traverse the reply chain
+                reply_chain = []
+                current_message = message
+                max_depth = 10
+                depth = 0
+                
+                while current_message.reference and depth < max_depth:
+                    try:
+                        replied_message = await message.channel.fetch_message(current_message.reference.message_id)
+                        reply_chain.insert(0, replied_message)
+                        current_message = replied_message
+                        depth += 1
+                    except:
+                        break
+                
+                logger.info(f'Found {len(reply_chain)} messages in reply chain')
+                
+                # Now get surrounding messages for additional context
+                # Only include messages within 2 minutes of each other to stay relevant
+                context_messages = []
+                time_window_seconds = 120  # 2 minutes
+                
+                if reply_chain:
+                    oldest_msg = reply_chain[0]
+                    
+                    # Get messages before the oldest message, but only if they're recent
+                    try:
+                        before_messages = []
+                        async for msg in message.channel.history(limit=10, before=oldest_msg.created_at):
+                            if msg.id != oldest_msg.id and not msg.author.bot:
+                                # Check time difference
+                                time_diff = (oldest_msg.created_at - msg.created_at).total_seconds()
+                                if time_diff <= time_window_seconds:
+                                    before_messages.append(msg)
+                                else:
+                                    # Stop when we hit a message too old
+                                    break
+                        before_messages.reverse()  # Chronological order
+                        context_messages.extend(before_messages)
+                        logger.info(f'Found {len(before_messages)} recent messages before reply chain (within 2 min)')
+                    except:
+                        pass
+                    
+                    # Add the reply chain
+                    context_messages.extend(reply_chain)
+                    
+                    # Get messages after the last message in chain (if not the current message)
+                    try:
+                        newest_msg = reply_chain[-1]
+                        after_messages = []
+                        async for msg in message.channel.history(limit=10, after=newest_msg.created_at, oldest_first=True):
+                            if msg.id != newest_msg.id and msg.id != message.id and not msg.author.bot:
+                                # Check time difference
+                                time_diff = (msg.created_at - newest_msg.created_at).total_seconds()
+                                if time_diff <= time_window_seconds:
+                                    after_messages.append(msg)
+                                else:
+                                    # Stop when we hit a message too far in the future
+                                    break
+                        context_messages.extend(after_messages)
+                        logger.info(f'Found {len(after_messages)} messages after reply chain (within 2 min)')
+                    except:
+                        pass
+                
+                # Collect images from all context messages
+                for msg in context_messages:
+                    # Collect images from attachments
+                    for attachment in msg.attachments:
+                        if attachment.content_type and attachment.content_type.startswith('image/'):
+                            if attachment.url not in image_urls:
+                                if is_supported_image(attachment.url) or attachment.content_type in ['image/jpeg', 'image/jpg', 'image/png', 'image/webp']:
+                                    image_urls.append(attachment.url)
+                                    logger.info(f'Found image in context: {attachment.filename}')
+                                else:
+                                    logger.warning(f'Skipping unsupported image in context: {attachment.filename}')
+                    
+                    # Collect image URLs from message content
+                    found_urls = re.findall(image_url_pattern, msg.content, re.IGNORECASE)
+                    for url in found_urls:
+                        if url not in image_urls:
+                            image_urls.append(url)
+                            logger.info(f'Found image URL in context: {url}')
+                    
+                    # Collect images from embeds
+                    for embed in msg.embeds:
+                        if embed.type in ['gifv', 'video', 'image', 'rich']:
+                            media_url = None
+                            
+                            if embed.image and embed.image.url:
+                                media_url = embed.image.url
+                            elif embed.video and embed.video.url:
+                                media_url = embed.video.url
+                            elif embed.thumbnail and embed.thumbnail.url:
+                                media_url = embed.thumbnail.url
+                            elif embed.url:
+                                media_url = embed.url
+                            
+                            if media_url and media_url not in image_urls:
+                                if is_supported_image(media_url):
+                                    image_urls.append(media_url)
+                                    logger.info(f'Found media in context embed ({embed.type}): {media_url}')
+                                else:
+                                    logger.warning(f'Skipping unsupported media in context: {media_url}')
+                
+                # Build context from all messages
+                if context_messages:
+                    context_parts = ["Here is the conversation context:\n"]
+                    for i, msg in enumerate(context_messages, 1):
+                        # Truncate very long messages to avoid token limits
+                        content = msg.content[:500] + "..." if len(msg.content) > 500 else msg.content
+                        context_parts.append(f"[{i}] {msg.author.name}: {content}")
+                    context_parts.append(f"\nUser's question: {prompt}")
+                    prompt = "\n".join(context_parts)
+                    logger.info(f'Built context with {len(context_messages)} total messages')
+                
+            except Exception as e:
+                logger.warning(f'Could not fetch conversation context: {e}')
+        
+        if not prompt and not image_urls:
+            logger.warning('No prompt or images found')
+            await message.reply("Please provide a question or image after mentioning me.")
+            return
+        
+        # Notify user about unsupported images if any
+        if unsupported_images and not image_urls:
+            await message.reply(f"⚠️ Found unsupported image format(s): {', '.join(unsupported_images)}\n\nGrok only supports: JPEG, PNG, and WebP images.")
+            return
+        elif unsupported_images:
+            logger.info(f'Proceeding with {len(image_urls)} supported images, ignoring {len(unsupported_images)} unsupported')
+        
+        # Query Grok
+        try:
+            async with message.channel.typing():
+                # Determine model based on whether we have images
+                model = "grok-2-vision-1212" if image_urls else "grok-4-fast"
+                logger.info(f'Using model: {model} (images: {len(image_urls)})')
+                
+                # Build message content with conversation history
+                if image_urls:
+                    # For vision model, use the multi-part content format
+                    # Vision model doesn't support conversation history with images well, so just send current message
+                    content = [{"type": "text", "text": prompt or "What's in this image?"}]
+                    for url in image_urls:
+                        content.append({"type": "image_url", "image_url": {"url": url}})
+                    
+                    logger.info('Sending request to Grok with images...')
+                    completion = client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "user", "content": content}
+                        ]
+                    )
+                else:
+                    # For text-only, include conversation history
+                    messages_to_send = []
+                    
+                    # Add conversation history if available
+                    if conversation_messages:
+                        messages_to_send.extend(conversation_messages)
+                    
+                    # Add current message
+                    messages_to_send.append({"role": "user", "content": prompt})
+                    
+                    logger.info(f'Sending text-only request to Grok with {len(messages_to_send)} messages (history: {len(conversation_messages)})')
+                    completion = client.chat.completions.create(
+                        model=model,
+                        messages=messages_to_send,
+                        extra_body={
+                            "search_parameters": {
+                                "mode": "auto",  # Let Grok decide when to search
+                                "max_search_results": 5
+                            }
+                        }
+                    )
+                
+                response = completion.choices[0].message.content
+                logger.info(f'Received response from Grok ({len(response)} characters)')
+                
+                # Store conversation history (only for non-search, text-only conversations)
+                if is_replying_to_bot and not is_search_followup and not image_urls:
+                    if message.channel.id not in conversation_history:
+                        conversation_history[message.channel.id] = {}
+                    if message.author.id not in conversation_history[message.channel.id]:
+                        conversation_history[message.channel.id][message.author.id] = []
+                    
+                    # Add user message and assistant response
+                    conversation_history[message.channel.id][message.author.id].append({"role": "user", "content": prompt})
+                    conversation_history[message.channel.id][message.author.id].append({"role": "assistant", "content": response})
+                    
+                    # Keep only last 20 messages (10 exchanges)
+                    conversation_history[message.channel.id][message.author.id] = conversation_history[message.channel.id][message.author.id][-20:]
+                    logger.info(f'Stored conversation history ({len(conversation_history[message.channel.id][message.author.id])} messages)')
+                
+                # Track token usage and calculate cost
+                request_cost = 0
+                usage_text = ""
+                if hasattr(completion, 'usage') and completion.usage:
+                    token_usage['input_tokens'] += completion.usage.prompt_tokens
+                    token_usage['output_tokens'] += completion.usage.completion_tokens
+                    token_usage['requests'] += 1
+                    
+                    # Calculate cost based on actual model used
+                    model_used = completion.model
+                    if 'vision' in model_used.lower():
+                        # Grok-vision pricing: $2/1M input, $10/1M output
+                        input_cost = (completion.usage.prompt_tokens / 1_000_000) * 2.00
+                        output_cost = (completion.usage.completion_tokens / 1_000_000) * 10.00
+                    else:
+                        # Grok-4-fast pricing: $0.20/1M input, $0.50/1M output
+                        # Account for cached tokens if available
+                        if hasattr(completion.usage, 'prompt_tokens_details') and completion.usage.prompt_tokens_details:
+                            cached = completion.usage.prompt_tokens_details.cached_tokens
+                            uncached = completion.usage.prompt_tokens - cached
+                            input_cost = (uncached / 1_000_000) * 0.20 + (cached / 1_000_000) * 0.05
+                        else:
+                            input_cost = (completion.usage.prompt_tokens / 1_000_000) * 0.20
+                        output_cost = (completion.usage.completion_tokens / 1_000_000) * 0.50
+                    
+                    request_cost = input_cost + output_cost
+                    usage_text = f"💵 ${request_cost:.6f} • {completion.usage.prompt_tokens} in / {completion.usage.completion_tokens} out"
+                    logger.info(f"Token usage - Input: {completion.usage.prompt_tokens}, Output: {completion.usage.completion_tokens}, Cost: ${request_cost:.6f}")
+                
+                # Create embed(s) for the response
+                # Discord embed description limit is 4096 characters
+                if len(response) <= 4096:
+                    embed = discord.Embed(
+                        description=response,
+                        color=discord.Color.blue(),
+                        timestamp=message.created_at
+                    )
+                    embed.set_author(
+                        name="Grok Response",
+                        icon_url="https://pbs.twimg.com/profile_images/1683899100922511378/5lY42eHs_400x400.jpg"
+                    )
+                    footer_text = f"Requested by {message.author.display_name}"
+                    if usage_text:
+                        footer_text += f" • {usage_text}"
+                    embed.set_footer(text=footer_text, icon_url=message.author.avatar.url if message.author.avatar else None)
+                    
+                    # Send reply and store in conversation history
+                    bot_message = await message.reply(embed=embed)
+                    
+                    # Store conversation for future context (keep original user prompt, not the full context)
+                    original_prompt = message.content.replace(f'<@{bot.user.id}>', '').replace(f'<@!{bot.user.id}>', '').strip()
+                    conversation_history[bot_message.id] = {
+                        'user_query': original_prompt,
+                        'bot_response': response,
+                        'model_used': model
+                    }
+                    logger.info(f'Stored conversation history for message {bot_message.id}')
+                else:
+                    # Split into multiple embeds if response is too long
+                    chunks = [response[i:i+4096] for i in range(0, len(response), 4096)]
+                    logger.info(f'Response split into {len(chunks)} embeds')
+                    bot_message = None
+                    for i, chunk in enumerate(chunks):
+                        embed = discord.Embed(
+                            description=chunk,
+                            color=discord.Color.blue(),
+                            timestamp=message.created_at
+                        )
+                        embed.set_author(
+                            name=f"Grok Response (Part {i+1}/{len(chunks)})",
+                            icon_url="https://pbs.twimg.com/profile_images/1683899100922511378/5lY42eHs_400x400.jpg"
+                        )
+                        if i == len(chunks) - 1:  # Only add footer to last embed
+                            footer_text = f"Requested by {message.author.display_name}"
+                            if usage_text:
+                                footer_text += f" • {usage_text}"
+                            embed.set_footer(text=footer_text, icon_url=message.author.avatar.url if message.author.avatar else None)
+                        
+                        # Only store the first message for conversation history
+                        if i == 0:
+                            bot_message = await message.reply(embed=embed)
+                        else:
+                            await message.reply(embed=embed)
+                    
+                    # Store conversation for future context
+                    if bot_message:
+                        original_prompt = message.content.replace(f'<@{bot.user.id}>', '').replace(f'<@!{bot.user.id}>', '').strip()
+                        conversation_history[bot_message.id] = {
+                            'user_query': original_prompt,
+                            'bot_response': response,
+                            'model_used': model
+                        }
+                        logger.info(f'Stored conversation history for message {bot_message.id}')
+                
+                logger.info('Response sent successfully')
+        except Exception as e:
+            logger.error(f'Error querying Grok: {e}', exc_info=True)
+            
+            # Provide user-friendly error messages
+            error_msg = str(e)
+            if "412" in error_msg and "Unsupported content-type" in error_msg:
+                await message.reply("❌ One or more images are in an unsupported format. Grok only accepts JPEG, PNG, and WebP images.\n\nPlease try again with supported image formats.")
+            elif "401" in error_msg or "authentication" in error_msg.lower():
+                await message.reply("❌ Authentication error. Please check the API key configuration.")
+            elif "429" in error_msg or "rate limit" in error_msg.lower():
+                await message.reply("⏳ Rate limit reached. Please try again in a few moments.")
+            elif "timeout" in error_msg.lower():
+                await message.reply("⏳ Request timed out. Please try again.")
+            else:
+                await message.reply(f"❌ Error querying Grok: {error_msg}")
+    
+    await bot.process_commands(message)
+
+bot.run(TOKEN)
